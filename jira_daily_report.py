@@ -53,6 +53,50 @@ class JiraClient:
         r.raise_for_status()
         return r.json()
 
+    def _search(self, jql, fields, max_results=100):
+        """
+        Search Jira issues with automatic pagination.
+        Tries the new /search/jql endpoint (nextPageToken) first;
+        falls back to legacy /search (startAt) if 404/410.
+        """
+        results = []
+        url_new = f"{self.base}/rest/api/3/search/jql"
+        url_old = f"{self.base}/rest/api/3/search"
+        token   = None
+        start   = 0
+        use_new = True   # will flip to False on first 404/410
+
+        while True:
+            if use_new:
+                params = {"jql": jql, "fields": fields, "maxResults": max_results}
+                if token:
+                    params["nextPageToken"] = token
+                r = requests.get(url_new, auth=self.auth,
+                                 headers=self.hdr, params=params)
+                if r.status_code in (404, 410):
+                    use_new = False          # Jira instance uses legacy API
+                    continue
+                r.raise_for_status()
+                data  = r.json()
+                chunk = data.get("issues", [])
+                results.extend(chunk)
+                token = data.get("nextPageToken")
+                if not token or len(chunk) < max_results:
+                    break
+            else:
+                params = {"jql": jql, "fields": fields,
+                          "startAt": start, "maxResults": max_results}
+                r = requests.get(url_old, auth=self.auth,
+                                 headers=self.hdr, params=params)
+                r.raise_for_status()
+                data  = r.json()
+                chunk = data.get("issues", [])
+                results.extend(chunk)
+                start += len(chunk)
+                if start >= data.get("total", 0) or not chunk:
+                    break
+        return results
+
     def active_sprint(self):
         """Return (board_id, sprint_dict) for the first active sprint."""
         boards = self._get("board", {"projectKeyOrId": config.JIRA_PROJECT}, agile=True)
@@ -65,10 +109,15 @@ class JiraClient:
         raise RuntimeError("No active sprint found for project: " + config.JIRA_PROJECT)
 
     def sprint_issues(self, board_id, sprint_id):
-        """Fetch every issue in the sprint (paginated)."""
+        """
+        Fetch sprint issues via board endpoint (reliable), then enrich
+        each issue's customfield_10014 (Epic Link) via a separate search,
+        because the board endpoint silently strips that field.
+        """
+        # ── Step 1: board endpoint (stable, paginated with startAt) ──
         issues, start = [], 0
         fields = ("summary,status,issuetype,priority,assignee,"
-                  "fixVersions,created,updated,description")
+                  "fixVersions,created,updated,description,parent")
         while True:
             data = self._get(
                 f"board/{board_id}/sprint/{sprint_id}/issue",
@@ -80,7 +129,61 @@ class JiraClient:
             start += len(chunk)
             if start >= data.get("total", 0):
                 break
+
+        # ── Step 2: enrich with Epic Link via search ──────────────────
+        # Fetch in batches of 50 keys to stay within JQL limits
+        keys = [i["key"] for i in issues]
+        epic_link_map = {}
+        batch_size = 50
+        for i in range(0, len(keys), batch_size):
+            batch = keys[i : i + batch_size]
+            jql   = f'key in ({",".join(batch)})'
+            try:
+                rows = self._search(jql, "customfield_10014,parent",
+                                    max_results=batch_size)
+                for row in rows:
+                    f  = row["fields"]
+                    ek = f.get("customfield_10014")
+                    if not ek:
+                        parent = f.get("parent") or {}
+                        ptype  = ((parent.get("fields") or {})
+                                  .get("issuetype", {}).get("name", ""))
+                        if ptype.lower() == "epic":
+                            ek = parent.get("key")
+                    if ek:
+                        epic_link_map[row["key"]] = ek
+            except Exception as ex:
+                print(f"    ⚠️  Epic link batch {i//batch_size+1} failed: {ex}")
+
+        # Apply enrichment back to issues
+        for issue in issues:
+            ek = epic_link_map.get(issue["key"])
+            if ek:
+                issue["fields"]["customfield_10014"] = ek
+
+        print(f"    Epic links resolved: {len(epic_link_map)}/{len(keys)} issues")
         return issues
+
+    def fetch_sprint_epics(self, sprint_name):
+        """
+        Fetch all Epics belonging to the active sprint.
+        The board endpoint NEVER returns Epics (Jira limitation),
+        so we query them separately via JQL on sprint name.
+        """
+        fields = ("summary,status,assignee,priority,"
+                  "fixVersions,labels,customfield_10014,parent")
+        jql = (f'project = {config.JIRA_PROJECT} '
+               f'AND sprint = "{sprint_name}" '
+               f'AND issuetype = Epic '
+               f'ORDER BY priority ASC')
+        return self._search(jql, fields, max_results=100)
+
+
+        """
+        Grouping is now done inside build_epic_tracker() using the already-
+        enriched sprint issues. This method is retained for API compatibility.
+        """
+        return {}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -267,6 +370,107 @@ def process(issues, sprint):
     )
 
 
+def build_epic_tracker(epics_in_sprint, epic_children_map, jira_base_url,
+                       all_sprint_issues=None):
+    """
+    Build rich per-epic metrics for the CTO Epic Tracker section.
+    epics_in_sprint   – list of epic issues from sprint_issues()
+    epic_children_map – legacy param (now unused; kept for API compat)
+    all_sprint_issues – full sprint issue list (used to build children map)
+    """
+    # Build children map from all sprint issues using customfield_10014
+    epic_keys = {e["key"] for e in epics_in_sprint}
+    children_map = {k: [] for k in epic_keys}
+    if all_sprint_issues:
+        for issue in all_sprint_issues:
+            f  = issue["fields"]
+            ek = f.get("customfield_10014")
+            if not ek:
+                parent = f.get("parent") or {}
+                ptype  = ((parent.get("fields") or {})
+                          .get("issuetype", {}).get("name", ""))
+                if ptype.lower() == "epic":
+                    ek = parent.get("key")
+            if ek and ek in epic_keys:
+                children_map[ek].append(issue)
+
+    tracker = []
+    for epic in epics_in_sprint:
+        f       = epic["fields"]
+        key     = epic["key"]
+        name    = f.get("summary","")
+        owner   = (f.get("assignee") or {}).get("displayName","Unassigned")
+        status  = f["status"]["name"]
+        priority = (f.get("priority") or {}).get("name","")
+        releases = [v["name"] for v in (f.get("fixVersions") or [])]
+        labels   = f.get("labels") or []
+        url      = f"{jira_base_url}/browse/{key}"
+
+        children = children_map.get(key, [])
+        total_ch  = len(children)
+
+        counts  = dict(done=0, qa=0, in_progress=0, open=0, other=0)
+        assignees = set()
+        platforms = set()
+        blocked   = []  # items with no assignee or stuck Open too long
+
+        for ch in children:
+            cf       = ch["fields"]
+            cs       = cf["status"]["name"]
+            cb       = bucket(cs)
+            cassign  = (cf.get("assignee") or {}).get("displayName","Unassigned")
+            cvers    = [v["name"] for v in (cf.get("fixVersions") or [])]
+            assignees.add(cassign)
+
+            for v in cvers:
+                vl = v.lower()
+                if   "android" in vl: platforms.add("Android")
+                elif "ios"     in vl: platforms.add("iOS")
+                elif "web"     in vl: platforms.add("Web")
+                elif "backend" in vl: platforms.add("Backend")
+                elif "admin"   in vl: platforms.add("Admin")
+
+            if   cb == "Done":        counts["done"]        += 1
+            elif cb == "QA":          counts["qa"]          += 1
+            elif cb == "In Progress": counts["in_progress"] += 1
+            elif cb == "Open":        counts["open"]        += 1
+            else:                     counts["other"]       += 1
+
+            if cassign == "Unassigned":
+                blocked.append(f'{ch["key"]}: {cf["summary"][:50]} (Unassigned)')
+
+        remaining = total_ch - counts["done"]
+        pct_done  = round(counts["done"] / total_ch * 100) if total_ch else 0
+        pct_qa    = round((counts["done"] + counts["qa"]) / total_ch * 100) if total_ch else 0
+
+        # Health signal: simple heuristic
+        if pct_done == 100:
+            health = "✅ Complete"
+            health_cls = "complete"
+        elif pct_done >= 60:
+            health = "🟢 On Track"
+            health_cls = "on-track"
+        elif pct_done >= 30 or counts["in_progress"] > 0:
+            health = "🟡 In Progress"
+            health_cls = "in-prog"
+        else:
+            health = "🔴 At Risk"
+            health_cls = "at-risk"
+
+        tracker.append(dict(
+            key=key, name=name, owner=owner, status=status,
+            priority=priority, releases=releases, labels=labels,
+            url=url, total=total_ch, counts=counts,
+            remaining=remaining, pct_done=pct_done, pct_qa=pct_qa,
+            assignees=sorted(assignees), platforms=sorted(platforms),
+            blocked=blocked, health=health, health_cls=health_cls,
+        ))
+
+    # Sort: complete last, then by pct_done desc
+    tracker.sort(key=lambda x: (x["health_cls"]=="complete", -x["pct_done"]))
+    return tracker
+
+
 # ══════════════════════════════════════════════════════════════
 #  CHARTS  (all return base64 PNG strings)
 # ══════════════════════════════════════════════════════════════
@@ -411,9 +615,59 @@ tr:hover td{background:#f9f9ff}
 .p3{color:#fb8c00}.p2{color:#43a047}.p1{color:#888}
 .on-track{color:#4CAF50;font-weight:bold}
 .behind{color:#F44336;font-weight:bold}
+.epic-card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;
+           margin-bottom:14px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.epic-card-hdr{padding:10px 16px;display:flex;align-items:center;
+               justify-content:space-between;gap:10px;flex-wrap:wrap}
+.epic-title{font-weight:bold;font-size:13px;color:#1a3c6e}
+.epic-key{font-size:10px;color:#666;margin-left:6px}
+.epic-meta{display:flex;gap:8px;flex-wrap:wrap;font-size:10.5px;color:#555;
+           padding:0 16px 8px;align-items:center}
+.epic-meta span{background:#f0f4ff;border-radius:4px;padding:2px 7px}
+.prog-bar-wrap{padding:0 16px 4px}
+.prog-bar-bg{background:#e0e0e0;border-radius:6px;height:10px;overflow:hidden;position:relative}
+.prog-bar-done{background:#4CAF50;height:100%;border-radius:6px}
+.prog-bar-qa{background:#9C27B0;height:100%;position:absolute;top:0;border-radius:0 6px 6px 0}
+.prog-label{font-size:10px;color:#555;margin-top:3px}
+.epic-tbl{width:100%;font-size:11px;margin:0}
+.epic-tbl th{padding:5px 10px;font-size:10px}
+.epic-tbl td{padding:5px 10px}
+.health-complete{color:#4CAF50;font-weight:bold}
+.health-on-track{color:#2196F3;font-weight:bold}
+.health-in-prog{color:#FF9800;font-weight:bold}
+.health-at-risk{color:#F44336;font-weight:bold}
 .ftr{background:#f4f6f8;padding:10px 28px;
      font-size:10px;color:#999;text-align:center}
 """
+
+def chart_epic_progress(tracker):
+    """Horizontal stacked bar — one bar per epic showing done/qa/inprog/open."""
+    if not tracker:
+        return None
+    names  = [f'{e["key"]}: {e["name"][:30]}{"…" if len(e["name"])>30 else ""}' for e in tracker]
+    done   = [e["counts"]["done"]        for e in tracker]
+    qa     = [e["counts"]["qa"]          for e in tracker]
+    inprog = [e["counts"]["in_progress"] for e in tracker]
+    open_  = [e["counts"]["open"]        for e in tracker]
+    totals = [e["total"] or 1            for e in tracker]
+
+    fig, ax = plt.subplots(figsize=(9, max(3, len(tracker)*0.55)))
+    y = range(len(tracker))
+    ax.barh(list(y), [d/t*100 for d,t in zip(done,totals)],   color="#4CAF50", label="Done",        height=0.55)
+    ax.barh(list(y), [q/t*100 for q,t in zip(qa,totals)],     color="#9C27B0", label="QA",          height=0.55,
+            left=[d/t*100 for d,t in zip(done,totals)])
+    left2 = [(d+q)/t*100 for d,q,t in zip(done,qa,totals)]
+    ax.barh(list(y), [i/t*100 for i,t in zip(inprog,totals)], color="#2196F3", label="In Progress", height=0.55, left=left2)
+    left3 = [(d+q+i)/t*100 for d,q,i,t in zip(done,qa,inprog,totals)]
+    ax.barh(list(y), [o/t*100 for o,t in zip(open_,totals)],  color="#F44336", label="Open",        height=0.55, left=left3)
+
+    ax.set_yticks(list(y)); ax.set_yticklabels(names, fontsize=7.5)
+    ax.set_xlabel("% Completion", fontsize=8)
+    ax.set_xlim(0,100)
+    ax.legend(loc="lower right", fontsize=7)
+    ax.set_title("Epic Progress Overview", fontsize=10, fontweight="bold", pad=8)
+    plt.tight_layout()
+    return _b64(fig)
 
 def _badge(status):
     s = status.lower()
@@ -439,7 +693,146 @@ def _th(*cols, bg="#1a3c6e"):
     return (f'<tr style="background:{bg};color:white">'
             + "".join(f"<th>{c}</th>" for c in cols) + "</tr>")
 
-def build_html(sprint, summary, charts):
+def build_sec_epic_tracker(tracker, epic_chart_b64):
+    """Build the full CTO Epic Tracker HTML section with live Jira links."""
+    import urllib.parse
+
+    def _epic_jira_link(url, text, style=""):
+        return f'<a href="{url}" target="_blank" style="text-decoration:none;{style}">{text}</a>'
+
+    def _epic_filter_link(base_url, jql, label, color="#1565c0"):
+        encoded = urllib.parse.quote(jql)
+        return (f'<a href="{base_url}/issues/?jql={encoded}" target="_blank" '
+                f'style="color:{color};font-size:9.5px;text-decoration:none;'
+                f'background:#e8f0fe;border-radius:3px;padding:1px 6px">'
+                f'🔗 {label}</a>')
+
+    # Summary KPI strip
+    total_epics = len(tracker)
+    complete    = sum(1 for e in tracker if e["health_cls"]=="complete")
+    on_track    = sum(1 for e in tracker if e["health_cls"]=="on-track")
+    in_prog     = sum(1 for e in tracker if e["health_cls"]=="in-prog")
+    at_risk     = sum(1 for e in tracker if e["health_cls"]=="at-risk")
+
+    summary_bar = (
+        f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px">'
+        f'<div class="kpi k-done"  style="flex:1;min-width:80px"><div class="v">{complete}</div><div class="l">Complete</div></div>'
+        f'<div class="kpi k-prog"  style="flex:1;min-width:80px"><div class="v">{on_track}</div><div class="l">On Track</div></div>'
+        f'<div class="kpi k-qa"    style="flex:1;min-width:80px"><div class="v">{in_prog}</div><div class="l">In Progress</div></div>'
+        f'<div class="kpi k-bug"   style="flex:1;min-width:80px"><div class="v">{at_risk}</div><div class="l">At Risk</div></div>'
+        f'<div class="kpi k-total" style="flex:1;min-width:80px"><div class="v">{total_epics}</div><div class="l">Total Epics</div></div>'
+        f'</div>'
+    )
+
+    chart_html = ""
+    if epic_chart_b64:
+        chart_html = f'<div class="charts">{_img(epic_chart_b64)}</div>'
+
+    # Per-epic cards
+    cards = []
+    for e in tracker:
+        base_url = e["url"].split("/browse/")[0]   # e.g. https://hike-platform.atlassian.net
+        hcls_map = {"complete":"health-complete","on-track":"health-on-track",
+                    "in-prog":"health-in-prog","at-risk":"health-at-risk"}
+        hcls = hcls_map.get(e["health_cls"],"")
+
+        # Jira filter links for each status bucket under this epic
+        jql_base = f'"Epic Link" = {e["key"]}'
+        lnk_done  = _epic_filter_link(base_url, jql_base + ' AND statusCategory = Done',        f'{e["counts"]["done"]} done',        "#4CAF50")
+        lnk_qa    = _epic_filter_link(base_url, jql_base + ' AND status in ("Ready For QA","QA In Progress","In QA")', f'{e["counts"]["qa"]} QA', "#9C27B0")
+        lnk_prog  = _epic_filter_link(base_url, jql_base + ' AND statusCategory = "In Progress"', f'{e["counts"]["in_progress"]} in progress', "#2196F3")
+        lnk_open  = _epic_filter_link(base_url, jql_base + ' AND statusCategory = "To Do"',    f'{e["counts"]["open"]} open',        "#F44336")
+        lnk_all   = _epic_filter_link(base_url, jql_base,                                       "all tasks →",                        "#555")
+
+        # Progress bar
+        done_pct = e["pct_done"]
+        prog_bar = (
+            f'<div class="prog-bar-wrap">'
+            f'<div class="prog-bar-bg">'
+            f'<div class="prog-bar-done" style="width:{done_pct}%"></div>'
+            f'</div>'
+            f'<div class="prog-label" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:4px">'
+            f'{lnk_done} {lnk_qa} {lnk_prog} {lnk_open}'
+            f'&nbsp;·&nbsp; <strong>{e["remaining"]} remaining</strong>'
+            f'&nbsp;·&nbsp; {done_pct}% complete'
+            f'&nbsp;·&nbsp; {lnk_all}'
+            f'</div></div>'
+        )
+
+        # Release pills (each clickable → Jira filter for that version)
+        rel_pills = " ".join(
+            _epic_filter_link(base_url,
+                f'"Epic Link" = {e["key"]} AND fixVersion = "{r}"', r, "#1565c0")
+            for r in e["releases"]
+        ) or '<span style="color:#aaa">None</span>'
+
+        platforms_str = ", ".join(e["platforms"]) or "—"
+
+        # Assignees — each clickable
+        assignee_links = ", ".join(
+            _epic_filter_link(base_url,
+                f'"Epic Link" = {e["key"]} AND assignee = "{a}"', a, "#333")
+            for a in e["assignees"][:5]
+        ) + ("…" if len(e["assignees"]) > 5 else "")
+
+        # Blocked / unassigned items
+        blocked_html = ""
+        if e["blocked"]:
+            items = "".join(
+                f'<li style="color:#b71c1c;font-size:10px">'
+                f'<a href="{base_url}/browse/{b.split(":")[0].strip()}" target="_blank" '
+                f'style="color:#b71c1c;font-weight:bold">{b.split(":")[0].strip()}</a>'
+                f':{":".join(b.split(":")[1:])}</li>'
+                for b in e["blocked"][:3]
+            )
+            blocked_html = (
+                f'<div style="padding:4px 16px 8px">'
+                f'<strong style="font-size:10px;color:#b71c1c">⚠️ Needs Owner:</strong>'
+                f'<ul style="margin:2px 0 0 16px">{items}</ul></div>'
+            )
+
+        e_name = e["name"]
+        e_key  = e["key"]
+        title_html = f'<span class="epic-title">{e_name}</span><span class="epic-key">&nbsp;{e_key}</span>'
+        card = (
+            f'<div class="epic-card">'
+            # Header: epic title links to epic in Jira
+            f'<div class="epic-card-hdr" style="background:#f5f7ff">'
+            f'  <div>'
+            f'    {_epic_jira_link(e["url"], title_html)}'
+            f'  </div>'
+            f'  <div style="display:flex;gap:8px;align-items:center">'
+            f'    {_badge(e["status"])}'
+            f'    <span class="{hcls}">{e["health"]}</span>'
+            f'    {_epic_filter_link(base_url, jql_base, "Open in Jira", "#1a3c6e")}'
+            f'  </div>'
+            f'</div>'
+            # Meta row
+            f'<div class="epic-meta">'
+            f'  <span>👤 Owner: <strong>{e["owner"]}</strong></span>'
+            f'  <span>🏷 Priority: {_pri(e["priority"])}</span>'
+            f'  <span>📱 Platforms: {platforms_str}</span>'
+            f'  <span>🚀 Releases: {rel_pills}</span>'
+            f'  <span>👥 Contributors: {assignee_links or "—"}</span>'
+            f'</div>'
+            + prog_bar
+            + blocked_html
+            + '</div>'
+        )
+        cards.append(card)
+
+    return (
+        '<div class="sec">'
+        '<h2>🗺️ Epic Tracker — CTO View</h2>'
+        + summary_bar
+        + chart_html
+        + "".join(cards)
+        + '</div>'
+    )
+
+
+
+def build_html(sprint, summary, charts, tracker=None):
     today     = datetime.now()
     start_raw = sprint.get("startDate","")[:10]
     end_raw   = sprint.get("endDate","")[:10]
@@ -477,33 +870,55 @@ def build_html(sprint, summary, charts):
   </div>
 </div>"""
 
+    jira_url = config.JIRA_BASE_URL.rstrip("/")
+
+    def _jira_link(key, text=None, color="#1a3c6e"):
+        """Clickable Jira issue link."""
+        label = text or key
+        return f'<a href="{jira_url}/browse/{key}" target="_blank" style="color:{color};font-weight:bold;text-decoration:none">{label}</a>'
+
+    def _jira_filter(jql, text, color="#1a3c6e"):
+        """Clickable Jira filter link (opens issue search)."""
+        import urllib.parse
+        encoded = urllib.parse.quote(jql)
+        return f'<a href="{jira_url}/issues/?jql={encoded}" target="_blank" style="color:{color};text-decoration:none;font-size:10px">🔗 {text}</a>'
+
+    sprint_name = sprint.get("name", "")
+
     # ─── 1. Overall Status Summary ────────────────────────────
     total = summary["total"]
-    rows = _th("Status","Count","%","Bar")
+    rows = _th("Status","Count","%","Bar","")
     for s,cnt in sorted(summary["status_counts"].items(),key=lambda x:-x[1]):
         p   = round(cnt/total*100) if total else 0
         bar = f'<div style="background:#2196F3;height:8px;border-radius:4px;width:{min(p,100)}%"></div>'
-        rows += f'<tr><td>{_badge(s)}</td><td><strong>{cnt}</strong></td><td>{p}%</td><td>{bar}</td></tr>'
-    rows += f'<tr style="font-weight:bold;background:#f0f4ff"><td>Total</td><td>{total}</td><td>100%</td><td></td></tr>'
+        jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND status = "{s}"'
+        rows += (f'<tr><td>{_badge(s)}</td><td><strong>{cnt}</strong></td>'
+                 f'<td>{p}%</td><td>{bar}</td>'
+                 f'<td>{_jira_filter(jql, "View in Jira")}</td></tr>')
+    rows += f'<tr style="font-weight:bold;background:#f0f4ff"><td>Total</td><td>{total}</td><td>100%</td><td></td><td></td></tr>'
     overall_chart_img = _img(charts['overall_pie'])
-    sec_overall = f"""
-<div class="sec">
-  <h2>📊 Overall Status Summary</h2>
-  <div class="charts">{overall_chart_img}</div>
-  <table>{rows}</table>
-</div>"""
+    jql_all = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}"'
+    sec_overall = (
+        '<div class="sec">'
+        '<h2>📊 Overall Status Summary &nbsp;' + _jira_filter(jql_all, "Open full sprint in Jira", "#555") + '</h2>'
+        '<div class="charts">' + overall_chart_img + '</div>'
+        '<table>' + rows + '</table>'
+        '</div>'
+    )
 
     # ─── 2. Issue Type Breakdown ──────────────────────────────
-    rows = _th("Type","Total","Done","In Progress","QA","Open","Completion",bg="#2c3e50")
+    rows = _th("Type","Total","Done","In Progress","QA","Open","Completion","",bg="#2c3e50")
     for t,d in summary["type_data"].items():
         if d["total"]==0: continue
+        jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND issuetype = "{t}"'
         rows += (f'<tr><td style="text-transform:capitalize;font-weight:bold">{t}</td>'
                  f'<td>{d["total"]}</td>'
                  f'<td style="color:#4CAF50">{d["done"]}</td>'
                  f'<td style="color:#2196F3">{d["in_progress"]}</td>'
                  f'<td style="color:#9C27B0">{d["qa"]}</td>'
                  f'<td style="color:#F44336">{d["open"]}</td>'
-                 f'<td>{_pct(d["done"],d["total"])}</td></tr>')
+                 f'<td>{_pct(d["done"],d["total"])}</td>'
+                 f'<td>{_jira_filter(jql, "View")}</td></tr>')
     type_chart_img = _img(charts['type_pie'])
     sec_types = f"""
 <div class="sec">
@@ -514,46 +929,62 @@ def build_html(sprint, summary, charts):
 
     # ─── 3. Epics & Stories Combined ─────────────────────────
     es_total = len(summary["epic_story"])
-    rows = _th("Status","Count","%","Bar",bg="#7b3fa0")
-    for s,cnt in sorted(summary["es_status_counts"].items(),key=lambda x:-x[1]):
-        p   = round(cnt/es_total*100) if es_total else 0
-        bar = f'<div style="background:#9C27B0;height:8px;border-radius:4px;width:{min(p,100)}%"></div>'
-        rows += f'<tr><td>{_badge(s)}</td><td><strong>{cnt}</strong></td><td>{p}%</td><td>{bar}</td></tr>'
-    rows += f'<tr style="font-weight:bold;background:#f5f0ff"><td>Total</td><td>{es_total}</td><td>100%</td><td></td></tr>'
-    sec_es = f"""
-<div class="sec">
-  <h2>📌 Epics &amp; Stories — Combined ({es_total} issues)</h2>
-  <table>{rows}</table>
-</div>"""
+    rows = _th("Key","Summary","Type","Status","",bg="#7b3fa0")
+    for es in summary["epic_story"]:
+        jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND issue = {es["key"]}'
+        rows += (f'<tr>'
+                 f'<td>{_jira_link(es["key"])}</td>'
+                 f'<td>{es["summary"][:70]}{"…" if len(es["summary"])>70 else ""}</td>'
+                 f'<td style="text-transform:capitalize">{es["type"]}</td>'
+                 f'<td>{_badge(es["status"])}</td>'
+                 f'<td>{_jira_filter(jql, "Open")}</td>'
+                 f'</tr>')
+    sec_es = (
+        '<div class="sec">'
+        '<h2>📌 Epics &amp; Stories — Combined (' + str(es_total) + ' issues)</h2>'
+        '<table>' + rows + '</table>'
+        '</div>'
+    )
 
     # ─── 4. Bug Status Breakdown ──────────────────────────────
     bug_total = summary["bugs_total"]
     bug_raw   = defaultdict(int)
     for b in summary["bug_list"]: bug_raw[b["status"]] += 1
-    rows = _th("Status","Count","%","Bar",bg="#c0392b")
+    rows = _th("Status","Count","%","Bar","",bg="#c0392b")
     for s,cnt in sorted(bug_raw.items(),key=lambda x:-x[1]):
         p   = round(cnt/bug_total*100) if bug_total else 0
         bar = f'<div style="background:#c0392b;height:8px;border-radius:4px;width:{min(p,100)}%"></div>'
-        rows += f'<tr><td>{_badge(s)}</td><td><strong>{cnt}</strong></td><td>{p}%</td><td>{bar}</td></tr>'
-    rows += f'<tr style="font-weight:bold;background:#fff5f5"><td>Total</td><td>{bug_total}</td><td>100%</td><td></td></tr>'
+        jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND issuetype = Bug AND status = "{s}"'
+        rows += (f'<tr><td>{_badge(s)}</td><td><strong>{cnt}</strong></td>'
+                 f'<td>{p}%</td><td>{bar}</td>'
+                 f'<td>{_jira_filter(jql, "View bugs")}</td></tr>')
+    rows += f'<tr style="font-weight:bold;background:#fff5f5"><td>Total</td><td>{bug_total}</td><td>100%</td><td></td><td></td></tr>'
     bug_chart_img = _img(charts['bug_pie'])
-    sec_bugs = f"""
-<div class="sec">
-  <h2>🐛 Bug Status Breakdown ({bug_total} bugs)</h2>
-  <div class="charts">{bug_chart_img}</div>
-  <table>{rows}</table>
-</div>"""
+    jql_bugs = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND issuetype = Bug'
+    sec_bugs = (
+        '<div class="sec">'
+        '<h2>🐛 Bug Status Breakdown (' + str(bug_total) + ' bugs) &nbsp;'
+        + _jira_filter(jql_bugs, "All bugs in Jira", "#555") + '</h2>'
+        '<div class="charts">' + bug_chart_img + '</div>'
+        '<table>' + rows + '</table>'
+        '</div>'
+    )
 
     # ─── 5. Release-wise Bifurcation ─────────────────────────
-    rows = _th("Release / Fix Version","Total","Bugs","Done","In Progress","QA","Open","Completion",bg="#1565c0")
+    rows = _th("Release / Fix Version","Total","Bugs","Done","In Progress","QA","Open","Completion","",bg="#1565c0")
     for rv,d in sorted(summary["release_data"].items()):
+        if rv == "Unversioned":
+            jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND fixVersion is EMPTY'
+        else:
+            jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND fixVersion = "{rv}"'
         rows += (f'<tr><td><strong>{rv}</strong></td><td>{d["total"]}</td>'
                  f'<td style="color:#F44336">{d["bugs"]}</td>'
                  f'<td style="color:#4CAF50">{d["done"]}</td>'
                  f'<td style="color:#2196F3">{d["in_progress"]}</td>'
                  f'<td style="color:#9C27B0">{d["qa"]}</td>'
                  f'<td style="color:#F44336">{d["open"]}</td>'
-                 f'<td>{_pct(d["done"],d["total"])}</td></tr>')
+                 f'<td>{_pct(d["done"],d["total"])}</td>'
+                 f'<td>{_jira_filter(jql, "View")}</td></tr>')
     release_chart_img = _img(charts['release_bar'])
     sec_release = f"""
 <div class="sec">
@@ -563,15 +994,24 @@ def build_html(sprint, summary, charts):
 </div>"""
 
     # ─── 6. App Version Bifurcation ──────────────────────────
-    rows = _th("Platform / Version","Total","Bugs","Done","In Progress","QA","Open","Completion",bg="#00695c")
+    rows = _th("Platform / Version","Total","Bugs","Done","In Progress","QA","Open","Completion","",bg="#00695c")
+    PLATFORM_VERSION_MAP = {
+        "Android": "Android", "iOS": "iOS", "Web": "Web",
+        "Backend": "Backend", "Admin Panel": "Admin",
+    }
     for pl,d in sorted(summary["platform_data"].items()):
+        if pl == "Unversioned":
+            jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND fixVersion is EMPTY'
+        else:
+            jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND fixVersion ~ "{PLATFORM_VERSION_MAP.get(pl, pl)}"'
         rows += (f'<tr><td><strong>{pl}</strong></td><td>{d["total"]}</td>'
                  f'<td style="color:#F44336">{d["bugs"]}</td>'
                  f'<td style="color:#4CAF50">{d["done"]}</td>'
                  f'<td style="color:#2196F3">{d["in_progress"]}</td>'
                  f'<td style="color:#9C27B0">{d["qa"]}</td>'
                  f'<td style="color:#F44336">{d["open"]}</td>'
-                 f'<td>{_pct(d["done"],d["total"])}</td></tr>')
+                 f'<td>{_pct(d["done"],d["total"])}</td>'
+                 f'<td>{_jira_filter(jql, "View")}</td></tr>')
     platform_chart_img = _img(charts['platform_pie'])
     sec_platform = f"""
 <div class="sec">
@@ -582,8 +1022,9 @@ def build_html(sprint, summary, charts):
 
     # ─── 7. Sprint Task Allocation – Per Person ───────────────
     rows = _th("Assignee","Total","Epic","Story","Task","Subtask","Bug",
-               "Done","In Progress","QA","Open","Completion",bg="#37474f")
+               "Done","In Progress","QA","Open","Completion","",bg="#37474f")
     for name,d in sorted(summary["assignee_data"].items(),key=lambda x:-x[1]["total"]):
+        jql = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND assignee = "{name}"'
         rows += (f'<tr><td><strong>{name}</strong></td><td>{d["total"]}</td>'
                  f'<td>{d["epic"]}</td><td>{d["story"]}</td>'
                  f'<td>{d["task"]}</td><td>{d["subtask"]}</td>'
@@ -592,7 +1033,8 @@ def build_html(sprint, summary, charts):
                  f'<td style="color:#2196F3">{d["in_progress"]}</td>'
                  f'<td style="color:#9C27B0">{d["qa"]}</td>'
                  f'<td style="color:#F44336">{d["open"]}</td>'
-                 f'<td>{_pct(d["done"],d["total"])}</td></tr>')
+                 f'<td>{_pct(d["done"],d["total"])}</td>'
+                 f'<td>{_jira_filter(jql, "View")}</td></tr>')
     td_ = summary["type_data"]
     rows += (f'<tr style="font-weight:bold;background:#eceff1">'
              f'<td>Total ({len(summary["assignee_data"])} members)</td>'
@@ -606,7 +1048,7 @@ def build_html(sprint, summary, charts):
              f'<td style="color:#2196F3">{summary["in_progress"]}</td>'
              f'<td style="color:#9C27B0">{summary["qa"]}</td>'
              f'<td style="color:#F44336">{summary["open"]}</td>'
-             f'<td>{summary["completion"]}%</td></tr>')
+             f'<td>{summary["completion"]}%</td><td></td></tr>')
     sec_assign = f"""
 <div class="sec">
   <h2>👤 Sprint Task Allocation — Per Person</h2>
@@ -634,11 +1076,11 @@ def build_html(sprint, summary, charts):
     rows = _th("Key","Summary","Status","Priority","Assignee",
                "Release","Created","Updated","Description",bg="#b71c1c")
     for b in summary["bug_list"]:
-        url  = f'{config.JIRA_BASE_URL}/browse/{b["key"]}'
+        url  = f'{jira_url}/browse/{b["key"]}'
         desc = b["description"].replace('"',"'")
         rows += (f'<tr>'
-                 f'<td><a href="{url}" style="color:#1a3c6e;font-weight:bold">{b["key"]}</a></td>'
-                 f'<td title="{desc}">{b["summary"][:65]}{"…" if len(b["summary"])>65 else ""}</td>'
+                 f'<td><a href="{url}" target="_blank" style="color:#1a3c6e;font-weight:bold;text-decoration:none">{b["key"]}</a></td>'
+                 f'<td><a href="{url}" target="_blank" style="color:#333;text-decoration:none" title="{desc}">{b["summary"][:65]}{"…" if len(b["summary"])>65 else ""}</a></td>'
                  f'<td>{_badge(b["status"])}</td>'
                  f'<td>{_pri(b["priority"])}</td>'
                  f'<td>{b["assignee"]}</td>'
@@ -647,15 +1089,24 @@ def build_html(sprint, summary, charts):
                  f'<td>{b["updated"]}</td>'
                  f'<td style="color:#555;max-width:200px">{b["description"][:130]}{"…" if len(b["description"])>130 else ""}</td>'
                  f'</tr>')
-    sec_bugsheet = f"""
-<div class="sec">
-  <h2>📋 Bug Sheet — Full Details ({len(summary["bug_list"])} bugs)</h2>
-  <div style="overflow-x:auto"><table>{rows}</table></div>
-</div>"""
+    jql_bugs_all = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}" AND issuetype = Bug ORDER BY priority DESC'
+    sec_bugsheet = (
+        '<div class="sec">'
+        '<h2>📋 Bug Sheet — Full Details (' + str(len(summary["bug_list"])) + ' bugs) &nbsp;'
+        + _jira_filter(jql_bugs_all, "Open all bugs in Jira", "#555") + '</h2>'
+        '<div style="overflow-x:auto"><table>' + rows + '</table></div>'
+        '</div>'
+    )
+
+    # ─── Epic Tracker (CTO View) — built, shown after Overall ─
+    sec_epic = ""
+    if tracker:
+        sec_epic = build_sec_epic_tracker(tracker, charts.get("epic_progress"))
 
     # ─── Assemble full email ──────────────────────────────────
-    # Use string concatenation so base64 content in sections never
-    # conflicts with f-string brace parsing (root cause of missing burndown).
+    # Epic tracker is position 2 — right after Overall Status Summary.
+    # Use string concatenation (never f-strings) so base64 in chart imgs
+    # never conflicts with brace parsing.
     parts = [
         '<!DOCTYPE html><html><head><meta charset="UTF-8">',
         '<style>', CSS, '</style></head><body><div class="wrap">',
@@ -663,7 +1114,9 @@ def build_html(sprint, summary, charts):
         '<h1>&#128202; Daily Progress Report &#8212; ' + config.JIRA_PROJECT + '</h1>',
         '<p>Sprint: <strong>' + sprint.get("name","") + '</strong>',
         ' &nbsp;|&nbsp; Report Date: ' + report_date + '</p></div>',
-        sec_meta, sec_overall, sec_types, sec_es, sec_bugs,
+        sec_meta, sec_overall,
+        sec_epic,          # ← Epic Tracker right after Overall Status
+        sec_types, sec_es, sec_bugs,
         sec_release, sec_platform, sec_assign, sec_burndown, sec_bugsheet,
         '<div class="ftr">Automated Daily Progress Report &#8212; ',
         config.JIRA_PROJECT + ' &#8212; ' + report_date,
@@ -677,7 +1130,7 @@ def build_html(sprint, summary, charts):
 #  PDF GENERATION  (using reportlab)
 # ══════════════════════════════════════════════════════════════
 
-def generate_pdf(sprint, summary, charts, pdf_path):
+def generate_pdf(sprint, summary, charts, pdf_path, tracker=None):
     """Generate a multi-page PDF report matching the HTML email sections."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
@@ -834,154 +1287,394 @@ def generate_pdf(sprint, summary, charts, pdf_path):
         ]))
         return tbl
 
-    # ── 1. Overall Status Summary ──────────────────────────────
-    sec_head("Overall Status Summary")
+    import urllib.parse as _urlparse
+
+    jira_url    = config.JIRA_BASE_URL.rstrip("/")
+    sprint_name = sprint.get("name", "")
+    jql_sprint  = f'project = {config.JIRA_PROJECT} AND sprint = "{sprint_name}"'
+
+    # ── Helpers ────────────────────────────────────────────────
+    def _jql_url(jql):
+        return f"{jira_url}/issues/?jql={_urlparse.quote(jql)}"
+
+    def _lnk(text, url, color="#1a3c6e", trunc=None, bold=False):
+        """Clickable paragraph."""
+        label = (str(text)[:trunc] + "…") if trunc and len(str(text)) > trunc else str(text)
+        label = label.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        w = "bold" if bold else "normal"
+        return Paragraph(
+            f'<link href="{url}" color="{color}"><b>{label}</b></link>' if bold else
+            f'<link href="{url}" color="{color}"><u>{label}</u></link>',
+            ParagraphStyle("lnk", parent=cell_style, textColor=colors.HexColor(color)))
+
+    def _jlnk(text, jql, color="#1a3c6e", trunc=None, bold=False):
+        return _lnk(text, _jql_url(jql), color=color, trunc=trunc, bold=bold)
+
+    def _p(text, trunc=None, color=None):
+        label = (str(text)[:trunc] + "…") if trunc and len(str(text)) > trunc else str(text)
+        label = label.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        style = cell_style if not color else ParagraphStyle(
+            "cp", parent=cell_style, textColor=colors.HexColor(color))
+        return Paragraph(label, style)
+
+    def _badge_p(status):
+        STATUS_COLORS = {
+            "Done":"#4CAF50","Closed":"#4CAF50","Resolved":"#4CAF50","Dev Done":"#4CAF50",
+            "QA Approved":"#4CAF50","Ready For Release":"#4CAF50",
+            "In Progress":"#2196F3","In Development":"#2196F3",
+            "Ready For QA":"#9C27B0","In QA":"#9C27B0","QA In Progress":"#9C27B0",
+            "Open":"#F44336","To Do":"#F44336","Reopened":"#F44336","Backlog":"#aaa",
+        }
+        col = STATUS_COLORS.get(status, "#607d8b")
+        s = status.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        return Paragraph(
+            f'<font color="white"><b> {s} </b></font>',
+            ParagraphStyle("bdg", parent=cell_style,
+                           backColor=colors.HexColor(col),
+                           borderPadding=2, textColor=WHITE))
+
+    def _pri_p(pri):
+        PRI_COLORS = {"Highest":"#d32f2f","High":"#f57c00","Medium":"#fbc02d",
+                      "Low":"#388e3c","Lowest":"#0288d1"}
+        col = PRI_COLORS.get(pri, "#607d8b")
+        p = pri.replace("&","&amp;")
+        return Paragraph(f'<font color="{col}"><b>{p}</b></font>', cell_style)
+
+    # ═══════════════════════════════════════════════════════════
+    # ── 1. Overall Status Summary  (matches HTML sec_overall) ──
+    # ═══════════════════════════════════════════════════════════
+    jql_all = jql_sprint
+    sec_head(f'📊 Overall Status Summary  '
+             f'<link href="{_jql_url(jql_all)}" color="#555"><u>🔗 Open full sprint in Jira</u></link>')
     story.append(b64_to_img(charts["overall_pie"], 90))
     story.append(Spacer(1, 4))
     total = summary["total"]
     rows_data = []
     for s, cnt in sorted(summary["status_counts"].items(), key=lambda x: -x[1]):
-        p = round(cnt/total*100) if total else 0
-        rows_data.append([s, cnt, f"{p}%", f"{'█'*int(p/5)}"])
-    rows_data.append(["Total", total, "100%", ""])
-    story.append(std_table(["Status","Count","%","Bar"], rows_data,
-                           col_widths=[80*mm, 30*mm, 25*mm, 45*mm]))
+        p   = round(cnt/total*100) if total else 0
+        jql = f'{jql_sprint} AND status = "{s}"'
+        bar_pct = min(p, 100)
+        rows_data.append([
+            _badge_p(s),
+            _jlnk(str(cnt), jql, color="#1a3c6e", bold=True),
+            _p(f"{p}%"),
+            _p(f"{'█'*int(p/5)}"),
+            _jlnk("🔗 View in Jira", jql, color="#555"),
+        ])
+    rows_data.append([_p("Total"), _p(total, color="#1a3c6e"), _p("100%"), _p(""), _p("")])
+    story.append(std_table(["Status","Count","%","Bar",""],
+                           rows_data, col_widths=[55*mm, 22*mm, 18*mm, 38*mm, 27*mm]))
     story.append(Spacer(1, 8))
 
-    # ── 2. Issue Type Breakdown ────────────────────────────────
-    sec_head("Issue Type Breakdown")
-    story.append(b64_to_img(charts["type_pie"], 90))
-    story.append(Spacer(1, 4))
+    # ═══════════════════════════════════════════════════════════
+    # ── 2. Epic Tracker — CTO View  (matches HTML sec_epic) ────
+    # ═══════════════════════════════════════════════════════════
+    if tracker:
+        # KPI strip
+        complete  = sum(1 for e in tracker if e["health_cls"]=="complete")
+        on_track  = sum(1 for e in tracker if e["health_cls"]=="on-track")
+        in_prog_e = sum(1 for e in tracker if e["health_cls"]=="in-prog")
+        at_risk   = sum(1 for e in tracker if e["health_cls"]=="at-risk")
+        kpi_data  = [[
+            Paragraph(f'<font color="white"><b>{complete}</b></font>',
+                      ParagraphStyle("kv", fontSize=14, alignment=1, fontName="Helvetica-Bold")),
+            Paragraph(f'<font color="white"><b>{on_track}</b></font>',
+                      ParagraphStyle("kv", fontSize=14, alignment=1, fontName="Helvetica-Bold")),
+            Paragraph(f'<font color="white"><b>{in_prog_e}</b></font>',
+                      ParagraphStyle("kv", fontSize=14, alignment=1, fontName="Helvetica-Bold")),
+            Paragraph(f'<font color="white"><b>{at_risk}</b></font>',
+                      ParagraphStyle("kv", fontSize=14, alignment=1, fontName="Helvetica-Bold")),
+            Paragraph(f'<font color="white"><b>{len(tracker)}</b></font>',
+                      ParagraphStyle("kv", fontSize=14, alignment=1, fontName="Helvetica-Bold")),
+        ],[
+            Paragraph('<font color="white">Complete</font>',
+                      ParagraphStyle("kl", fontSize=7, alignment=1, fontName="Helvetica")),
+            Paragraph('<font color="white">On Track</font>',
+                      ParagraphStyle("kl", fontSize=7, alignment=1, fontName="Helvetica")),
+            Paragraph('<font color="white">In Progress</font>',
+                      ParagraphStyle("kl", fontSize=7, alignment=1, fontName="Helvetica")),
+            Paragraph('<font color="white">At Risk</font>',
+                      ParagraphStyle("kl", fontSize=7, alignment=1, fontName="Helvetica")),
+            Paragraph('<font color="white">Total Epics</font>',
+                      ParagraphStyle("kl", fontSize=7, alignment=1, fontName="Helvetica")),
+        ]]
+        kpi_tbl = Table(kpi_data, colWidths=[(W-2*margin)/5]*5)
+        kpi_tbl.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(0,-1), GREEN),
+            ("BACKGROUND",(1,0),(1,-1), BLUE),
+            ("BACKGROUND",(2,0),(2,-1), colors.HexColor("#00BCD4")),
+            ("BACKGROUND",(3,0),(3,-1), RED),
+            ("BACKGROUND",(4,0),(4,-1), NAVY),
+            ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),
+        ]))
+        sec_head("🗺️ Epic Tracker — CTO View")
+        story.append(kpi_tbl)
+        story.append(Spacer(1, 4))
+
+        # Progress chart
+        epic_chart_b64 = charts.get("epic_progress")
+        if epic_chart_b64:
+            import io as _io2
+            img_data = base64.b64decode(epic_chart_b64)
+            img_buf  = _io2.BytesIO(img_data)
+            from reportlab.platypus import Image as RLImage
+            rl_img = RLImage(img_buf, width=170*mm, height=max(40*mm, len(tracker)*8*mm))
+            story.append(rl_img)
+            story.append(Spacer(1, 4))
+
+        # Per-epic table — matches HTML epic cards
+        HCLS_COLORS = {"complete":"#4CAF50","on-track":"#2196F3",
+                       "in-prog":"#FF9800","at-risk":"#F44336"}
+        epic_rows = []
+        for e in tracker:
+            counts  = e["counts"]
+            jql_e   = f'"Epic Link" = {e["key"]}'
+            hcol    = HCLS_COLORS.get(e["health_cls"],"#607d8b")
+            rel_str = ", ".join(e["releases"][:3]) or "—"
+            contrib = ", ".join(e["assignees"][:3]) + ("…" if len(e["assignees"])>3 else "") or "—"
+            epic_rows.append([
+                _lnk(e["key"],  e["url"], color="#1a3c6e", bold=True),
+                _lnk(e["name"], e["url"], color="#1a3c6e", trunc=34),
+                _badge_p(e["status"]),
+                Paragraph(f'<font color="{hcol}"><b>{e["health"]}</b></font>', cell_style),
+                _p(f'{e["pct_done"]}%', color="#1a3c6e"),
+                _jlnk(str(counts["done"]),        jql_e+' AND statusCategory = Done',           color="#4CAF50", bold=True),
+                _jlnk(str(counts["qa"]),          jql_e+' AND status in ("Ready For QA","In QA","QA In Progress")', color="#9C27B0", bold=True),
+                _jlnk(str(counts["in_progress"]), jql_e+' AND statusCategory = "In Progress"',  color="#2196F3", bold=True),
+                _jlnk(str(counts["open"]),        jql_e+' AND statusCategory = "To Do"',        color="#F44336", bold=True),
+                _p(str(e["remaining"]), color="#555"),
+                _p(e["owner"], trunc=16),
+                _p(rel_str, trunc=20),
+            ])
+        story.append(std_table(
+            ["Key","Epic","Status","Health","%","✅","🔬","🔄","⏳","Left","Owner","Releases"],
+            epic_rows,
+            col_widths=[16*mm,36*mm,22*mm,20*mm,10*mm,10*mm,10*mm,10*mm,10*mm,12*mm,22*mm,14*mm],
+            hdr_bg=NAVY))
+        story.append(Spacer(1, 8))
+
+    # ═══════════════════════════════════════════════════════════
+    # ── 3. Issue Type Breakdown  (matches HTML sec_types) ──────
+    # ═══════════════════════════════════════════════════════════
+    sec_head("🔖 Issue Type Breakdown")
     rows_data = []
     for t, d in summary["type_data"].items():
         if d["total"] == 0: continue
         comp = f"{round(d['done']/d['total']*100)}%" if d["total"] else "0%"
-        rows_data.append([t.capitalize(), d["total"], d["done"],
-                          d["in_progress"], d["qa"], d["open"], comp])
+        jql_t = f'{jql_sprint} AND issuetype = "{t}"'
+        rows_data.append([
+            _p(t.capitalize()),
+            _jlnk(str(d["total"]),       jql_t,                                              color="#1a3c6e", bold=True),
+            _jlnk(str(d["done"]),        jql_t+' AND statusCategory = Done',                color="#4CAF50", bold=True),
+            _jlnk(str(d["in_progress"]), jql_t+' AND statusCategory = "In Progress"',        color="#2196F3", bold=True),
+            _jlnk(str(d["qa"]),          jql_t+' AND status in ("Ready For QA","In QA")',    color="#9C27B0", bold=True),
+            _jlnk(str(d["open"]),        jql_t+' AND statusCategory = "To Do"',              color="#F44336", bold=True),
+            _p(comp),
+            _jlnk("🔗 View", jql_t, color="#555"),
+        ])
     story.append(std_table(
-        ["Type","Total","Done","In Progress","QA","Open","Completion"], rows_data,
-        col_widths=[40*mm,25*mm,25*mm,30*mm,25*mm,25*mm,30*mm],
+        ["Type","Total","Done","In Progress","QA","Open","Completion",""],
+        rows_data,
+        col_widths=[32*mm,20*mm,20*mm,26*mm,20*mm,20*mm,22*mm,20*mm],
         hdr_bg=colors.HexColor("#2c3e50")))
     story.append(Spacer(1, 8))
 
-    # ── 3. Epics & Stories ─────────────────────────────────────
-    sec_head(f"Epics & Stories — Combined ({len(summary['epic_story'])} issues)")
-    es_total = len(summary["epic_story"])
+    # ═══════════════════════════════════════════════════════════
+    # ── 4. Epics & Stories Combined  (matches HTML sec_es) ─────
+    # ═══════════════════════════════════════════════════════════
+    sec_head(f'📌 Epics & Stories — Combined ({len(summary["epic_story"])} issues)')
     rows_data = []
-    for s, cnt in sorted(summary["es_status_counts"].items(), key=lambda x: -x[1]):
-        p = round(cnt/es_total*100) if es_total else 0
-        rows_data.append([s, cnt, f"{p}%"])
-    rows_data.append(["Total", es_total, "100%"])
-    story.append(std_table(["Status","Count","%"], rows_data,
-                           col_widths=[100*mm, 40*mm, 40*mm],
+    for es in summary["epic_story"]:
+        issue_url = f"{jira_url}/browse/{es['key']}"
+        jql_es = f'{jql_sprint} AND issue = {es["key"]}'
+        rows_data.append([
+            _lnk(es["key"], issue_url, color="#1a3c6e", bold=True),
+            _lnk(es["summary"], issue_url, color="#333", trunc=62),
+            _p(es["type"].capitalize()),
+            _badge_p(es["status"]),
+            _jlnk("🔗 Open", jql_es, color="#555"),
+        ])
+    story.append(std_table(["Key","Summary","Type","Status",""],
+                           rows_data, col_widths=[18*mm,88*mm,20*mm,28*mm,18*mm],
                            hdr_bg=colors.HexColor("#7b3fa0")))
     story.append(Spacer(1, 8))
 
-    # ── 4. Bug Status Breakdown ────────────────────────────────
-    sec_head(f"Bug Status Breakdown ({summary['bugs_total']} bugs)")
+    # ═══════════════════════════════════════════════════════════
+    # ── 5. Bug Status Breakdown  (matches HTML sec_bugs) ───────
+    # ═══════════════════════════════════════════════════════════
+    jql_bugs = f'{jql_sprint} AND issuetype = Bug'
+    sec_head(f'🐛 Bug Status Breakdown ({summary["bugs_total"]} bugs)  '
+             f'<link href="{_jql_url(jql_bugs)}" color="#555"><u>🔗 All bugs in Jira</u></link>')
     story.append(b64_to_img(charts["bug_pie"], 90))
     story.append(Spacer(1, 4))
     bug_raw = defaultdict(int)
     for b in summary["bug_list"]: bug_raw[b["status"]] += 1
     rows_data = []
     for s, cnt in sorted(bug_raw.items(), key=lambda x: -x[1]):
-        p = round(cnt/summary["bugs_total"]*100) if summary["bugs_total"] else 0
-        rows_data.append([s, cnt, f"{p}%"])
-    rows_data.append(["Total", summary["bugs_total"], "100%"])
-    story.append(std_table(["Status","Count","%"], rows_data,
-                           col_widths=[100*mm, 40*mm, 40*mm],
+        p   = round(cnt/summary["bugs_total"]*100) if summary["bugs_total"] else 0
+        jql = f'{jql_bugs} AND status = "{s}"'
+        rows_data.append([
+            _badge_p(s),
+            _jlnk(str(cnt), jql, color="#1a3c6e", bold=True),
+            _p(f"{p}%"),
+            _p(f"{'█'*int(p/5)}"),
+            _jlnk("🔗 View bugs", jql, color="#555"),
+        ])
+    rows_data.append([_p("Total"), _p(summary["bugs_total"]), _p("100%"), _p(""), _p("")])
+    story.append(std_table(["Status","Count","%","Bar",""],
+                           rows_data, col_widths=[55*mm,22*mm,18*mm,38*mm,27*mm],
                            hdr_bg=colors.HexColor("#c0392b")))
     story.append(Spacer(1, 8))
 
-    # ── 5. Release-wise Bifurcation ────────────────────────────
-    sec_head("Release-wise Bifurcation")
+    # ═══════════════════════════════════════════════════════════
+    # ── 6. Release-wise Bifurcation  (matches HTML sec_release)─
+    # ═══════════════════════════════════════════════════════════
+    sec_head("🚀 Release-wise Bifurcation")
     story.append(b64_to_img(charts["release_bar"], 130))
     story.append(Spacer(1, 4))
     rows_data = []
     for rv, d in sorted(summary["release_data"].items()):
         comp = f"{round(d['done']/d['total']*100)}%" if d["total"] else "0%"
-        rows_data.append([rv, d["total"], d["bugs"], d["done"],
-                          d["in_progress"], d["qa"], d["open"], comp])
+        jql_rv = (f'{jql_sprint} AND fixVersion is EMPTY' if rv == "Unversioned"
+                  else f'{jql_sprint} AND fixVersion = "{rv}"')
+        rows_data.append([
+            _p(rv),
+            _jlnk(str(d["total"]),       jql_rv,                                             color="#1a3c6e", bold=True),
+            _jlnk(str(d["bugs"]),        jql_rv+' AND issuetype = Bug',                      color="#F44336", bold=True),
+            _jlnk(str(d["done"]),        jql_rv+' AND statusCategory = Done',                color="#4CAF50", bold=True),
+            _jlnk(str(d["in_progress"]), jql_rv+' AND statusCategory = "In Progress"',       color="#2196F3", bold=True),
+            _jlnk(str(d["qa"]),          jql_rv+' AND status in ("Ready For QA","In QA")',   color="#9C27B0", bold=True),
+            _jlnk(str(d["open"]),        jql_rv+' AND statusCategory = "To Do"',             color="#F44336", bold=True),
+            _p(comp),
+            _jlnk("🔗 View", jql_rv, color="#555"),
+        ])
     story.append(std_table(
-        ["Release","Total","Bugs","Done","In Progress","QA","Open","Completion"],
+        ["Release","Total","Bugs","Done","In Progress","QA","Open","Completion",""],
         rows_data,
-        col_widths=[45*mm,20*mm,20*mm,20*mm,25*mm,20*mm,20*mm,25*mm],
+        col_widths=[38*mm,16*mm,16*mm,16*mm,22*mm,16*mm,16*mm,20*mm,16*mm],
         hdr_bg=colors.HexColor("#1565c0")))
     story.append(PageBreak())
 
-    # ── 6. App Version Bifurcation ─────────────────────────────
-    sec_head("App Version Bifurcation")
+    # ═══════════════════════════════════════════════════════════
+    # ── 7. App Version Bifurcation  (matches HTML sec_platform)─
+    # ═══════════════════════════════════════════════════════════
+    PLATFORM_VERSION_MAP = {"Android":"Android","iOS":"iOS","Web":"Web",
+                            "Backend":"Backend","Admin Panel":"Admin"}
+    sec_head("📱 App Version Bifurcation")
     story.append(b64_to_img(charts["platform_pie"], 90))
     story.append(Spacer(1, 4))
     rows_data = []
     for pl, d in sorted(summary["platform_data"].items()):
         comp = f"{round(d['done']/d['total']*100)}%" if d["total"] else "0%"
-        rows_data.append([pl, d["total"], d["bugs"], d["done"],
-                          d["in_progress"], d["qa"], d["open"], comp])
+        jql_pl = (f'{jql_sprint} AND fixVersion is EMPTY' if pl == "Unversioned"
+                  else f'{jql_sprint} AND fixVersion ~ "{PLATFORM_VERSION_MAP.get(pl,pl)}"')
+        rows_data.append([
+            _p(pl),
+            _jlnk(str(d["total"]),       jql_pl,                                             color="#1a3c6e", bold=True),
+            _jlnk(str(d["bugs"]),        jql_pl+' AND issuetype = Bug',                      color="#F44336", bold=True),
+            _jlnk(str(d["done"]),        jql_pl+' AND statusCategory = Done',                color="#4CAF50", bold=True),
+            _jlnk(str(d["in_progress"]), jql_pl+' AND statusCategory = "In Progress"',       color="#2196F3", bold=True),
+            _jlnk(str(d["qa"]),          jql_pl+' AND status in ("Ready For QA","In QA")',   color="#9C27B0", bold=True),
+            _jlnk(str(d["open"]),        jql_pl+' AND statusCategory = "To Do"',             color="#F44336", bold=True),
+            _p(comp),
+            _jlnk("🔗 View", jql_pl, color="#555"),
+        ])
     story.append(std_table(
-        ["Platform","Total","Bugs","Done","In Progress","QA","Open","Completion"],
+        ["Platform","Total","Bugs","Done","In Progress","QA","Open","Completion",""],
         rows_data,
-        col_widths=[40*mm,20*mm,20*mm,20*mm,25*mm,20*mm,20*mm,25*mm],
+        col_widths=[35*mm,16*mm,16*mm,16*mm,22*mm,16*mm,16*mm,20*mm,16*mm],
         hdr_bg=colors.HexColor("#00695c")))
     story.append(Spacer(1, 8))
 
-    # ── 7. Sprint Task Allocation ──────────────────────────────
-    sec_head("Sprint Task Allocation — Per Person")
+    # ═══════════════════════════════════════════════════════════
+    # ── 8. Sprint Task Allocation – Per Person  (HTML sec_assign)
+    # ═══════════════════════════════════════════════════════════
+    sec_head("👤 Sprint Task Allocation — Per Person")
     rows_data = []
     for name, d in sorted(summary["assignee_data"].items(), key=lambda x: -x[1]["total"]):
-        comp = f"{round(d['done']/d['total']*100)}%" if d["total"] else "0%"
-        rows_data.append([name, d["total"], d["epic"], d["story"], d["task"],
-                          d["subtask"], d["bug"], d["done"], d["in_progress"],
-                          d["qa"], d["open"], comp])
+        comp  = f"{round(d['done']/d['total']*100)}%" if d["total"] else "0%"
+        jql_a = f'{jql_sprint} AND assignee = "{name}"'
+        rows_data.append([
+            _jlnk(name, jql_a, color="#1a3c6e", trunc=18, bold=True),
+            _jlnk(str(d["total"]),       jql_a,                                               color="#1a3c6e", bold=True),
+            _p(str(d["epic"])),
+            _p(str(d["story"])),
+            _p(str(d["task"])),
+            _p(str(d["subtask"])),
+            _jlnk(str(d["bug"]),         jql_a+' AND issuetype = Bug',                        color="#F44336", bold=True),
+            _jlnk(str(d["done"]),        jql_a+' AND statusCategory = Done',                  color="#4CAF50", bold=True),
+            _jlnk(str(d["in_progress"]), jql_a+' AND statusCategory = "In Progress"',         color="#2196F3", bold=True),
+            _jlnk(str(d["qa"]),          jql_a+' AND status in ("Ready For QA","In QA")',     color="#9C27B0", bold=True),
+            _jlnk(str(d["open"]),        jql_a+' AND statusCategory = "To Do"',               color="#F44336", bold=True),
+            _p(comp),
+            _jlnk("🔗 View", jql_a, color="#555"),
+        ])
     td_ = summary["type_data"]
     rows_data.append([
-        f"Total ({len(summary['assignee_data'])} members)",
-        summary["total"],
-        td_.get("epic",{}).get("total",0), td_.get("story",{}).get("total",0),
-        td_.get("task",{}).get("total",0), td_.get("subtask",{}).get("total",0),
-        summary["bugs_total"], summary["done"], summary["in_progress"],
-        summary["qa"], summary["open"], f"{summary['completion']}%",
+        _p(f'Total ({len(summary["assignee_data"])} members)'),
+        _p(str(summary["total"])),
+        _p(str(td_.get("epic",{}).get("total",0))),
+        _p(str(td_.get("story",{}).get("total",0))),
+        _p(str(td_.get("task",{}).get("total",0))),
+        _p(str(td_.get("subtask",{}).get("total",0))),
+        _p(str(summary["bugs_total"]), color="#F44336"),
+        _p(str(summary["done"]),       color="#4CAF50"),
+        _p(str(summary["in_progress"]),color="#2196F3"),
+        _p(str(summary["qa"]),         color="#9C27B0"),
+        _p(str(summary["open"]),       color="#F44336"),
+        _p(f'{summary["completion"]}%'),
+        _p(""),
     ])
     story.append(std_table(
-        ["Assignee","Total","Epic","Story","Task","Subtask","Bug",
-         "Done","In Prog","QA","Open","Completion"],
+        ["Assignee","Total","Epic","Story","Task","Sub","Bug",
+         "Done","In Prog","QA","Open","Comp",""],
         rows_data,
-        col_widths=[38*mm,16*mm,14*mm,14*mm,14*mm,16*mm,14*mm,
-                    14*mm,16*mm,14*mm,14*mm,16*mm],
+        col_widths=[34*mm,14*mm,12*mm,12*mm,12*mm,12*mm,12*mm,
+                    14*mm,16*mm,12*mm,12*mm,14*mm,14*mm],
         hdr_bg=colors.HexColor("#37474f")))
     story.append(Spacer(1, 8))
 
-    # ── 8. Sprint Burndown ─────────────────────────────────────
-    sec_head("Sprint Burndown (Issues Remaining by Day)")
+    # ═══════════════════════════════════════════════════════════
+    # ── 9. Sprint Burndown  (matches HTML sec_burndown) ─────────
+    # ═══════════════════════════════════════════════════════════
+    sec_head("📉 Sprint Burndown (Issues Remaining by Day)")
     story.append(b64_to_img(charts["burndown"], 155))
     story.append(Spacer(1, 4))
     rows_data = []
     for r in summary["burndown_rows"]:
         act = str(r["actual"]) if r["actual"] is not None else "—"
-        rows_data.append([r["date"], r["ideal"], act, r["status"]])
+        col = "#4CAF50" if r["status"]=="On Track" else "#F44336" if r["status"]=="Behind" else "#888"
+        rows_data.append([_p(r["date"]), _p(str(r["ideal"])), _p(act), _p(r["status"], color=col)])
     story.append(std_table(
         ["Date","Ideal Remaining","Actual Remaining","Status"], rows_data,
         col_widths=[50*mm, 45*mm, 45*mm, 40*mm],
         hdr_bg=colors.HexColor("#4a148c")))
     story.append(PageBreak())
 
-    # ── 9. Bug Sheet – Full Details ────────────────────────────
-    sec_head(f"Bug Sheet — Full Details ({len(summary['bug_list'])} bugs)")
+    # ═══════════════════════════════════════════════════════════
+    # ── 10. Bug Sheet – Full Details  (matches HTML sec_bugsheet)
+    # ═══════════════════════════════════════════════════════════
+    jql_bugs_all = f'{jql_sprint} AND issuetype = Bug ORDER BY priority DESC'
+    sec_head(f'📋 Bug Sheet — Full Details ({len(summary["bug_list"])} bugs)  '
+             f'<link href="{_jql_url(jql_bugs_all)}" color="#555"><u>🔗 Open all bugs in Jira</u></link>')
     rows_data = []
     for b in summary["bug_list"]:
+        issue_url = f"{jira_url}/browse/{b['key']}"
+        jql_a = f'{jql_sprint} AND issuetype = Bug AND assignee = "{b["assignee"]}"'
         rows_data.append([
-            b["key"],
-            b["summary"][:55] + ("…" if len(b["summary"]) > 55 else ""),
-            b["status"],
-            b["priority"],
-            b["assignee"],
-            b["release"],
-            b["updated"],
+            _lnk(b["key"],     issue_url, color="#1a3c6e", bold=True),
+            _lnk(b["summary"], issue_url, color="#333",    trunc=52),
+            _badge_p(b["status"]),
+            _pri_p(b["priority"]),
+            _p(b["assignee"], trunc=16),
+            _p(b["release"],  trunc=14),
+            _p(b["created"]),
+            _p(b["updated"]),
         ])
     story.append(std_table(
-        ["Key","Summary","Status","Priority","Assignee","Release","Updated"],
+        ["Key","Summary","Status","Priority","Assignee","Release","Created","Updated"],
         rows_data,
-        col_widths=[20*mm, 58*mm, 28*mm, 20*mm, 32*mm, 22*mm, 20*mm],
+        col_widths=[18*mm, 52*mm, 26*mm, 18*mm, 28*mm, 20*mm, 18*mm, 16*mm],
         hdr_bg=colors.HexColor("#b71c1c")))
 
     doc.build(story)
@@ -992,7 +1685,8 @@ def generate_pdf(sprint, summary, charts, pdf_path):
 #  EMAIL SENDER  (HTML body + PDF attachment)
 # ══════════════════════════════════════════════════════════════
 
-def send_email(subject, html_body, pdf_path):
+def send_email(subject, html_body, pdf_path, html_path=None):
+    """Send email with HTML body + PDF + HTML file as attachments."""
     from email.mime.base import MIMEBase
     from email import encoders
 
@@ -1001,9 +1695,9 @@ def send_email(subject, html_body, pdf_path):
     msg["From"]    = config.EMAIL_FROM
     msg["To"]      = ", ".join(config.EMAIL_TO)
 
-    # HTML body
+    # HTML body (inline, readable in email client)
     alt = MIMEMultipart("alternative")
-    alt.attach(MIMEText(html_body, "html"))
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
     msg.attach(alt)
 
     # PDF attachment
@@ -1014,6 +1708,16 @@ def send_email(subject, html_body, pdf_path):
     part.add_header("Content-Disposition",
                     f'attachment; filename="{os.path.basename(pdf_path)}"')
     msg.attach(part)
+
+    # HTML file attachment (has clickable Jira links)
+    if html_path and os.path.exists(html_path):
+        with open(html_path, "rb") as f:
+            html_part = MIMEBase("text", "html", charset="utf-8")
+            html_part.set_payload(f.read())
+        encoders.encode_base64(html_part)
+        html_part.add_header("Content-Disposition",
+                             f'attachment; filename="{os.path.basename(html_path)}"')
+        msg.attach(html_part)
 
     with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT) as srv:
         srv.ehlo(); srv.starttls()
@@ -1027,8 +1731,12 @@ def send_email(subject, html_body, pdf_path):
 # ══════════════════════════════════════════════════════════════
 
 import os
+import sys
 
 def main():
+    # ── Argument parsing ──────────────────────────────────────
+    local_only = "--local" in sys.argv   # run locally: generate HTML/PDF, skip email
+
     print("🔄  Connecting to Jira…")
     client = JiraClient()
 
@@ -1045,6 +1753,27 @@ def main():
     print(f"    {summary['total']} issues | {summary['bugs_total']} bugs | "
           f"{summary['completion']}% done")
 
+    # ── Epic Tracker ─────────────────────────────────────────
+    # NOTE: Jira board endpoint NEVER returns Epics — they must be
+    # fetched separately via JQL. This is a hard Jira limitation.
+    print("🔄  Fetching sprint epics (separate JQL call)…")
+    try:
+        epics_in_sprint = client.fetch_sprint_epics(sprint["name"])
+        epic_keys = [e["key"] for e in epics_in_sprint]
+        print(f"    Found {len(epic_keys)} epics: {', '.join(epic_keys)}")
+    except Exception as ex:
+        print(f"    ⚠️  Epic fetch failed: {ex} — Epic Tracker will be empty")
+        epics_in_sprint = []
+        epic_keys = []
+
+    tracker = build_epic_tracker(
+        epics_in_sprint, {}, config.JIRA_BASE_URL,
+        all_sprint_issues=issues
+    )
+    total_children = sum(e["total"] for e in tracker)
+    print(f"    Epic tracker built: {len(tracker)} epics, {total_children} child issues linked")
+
+    # ── Charts ───────────────────────────────────────────────
     print("🔄  Generating charts…")
     charts = {
         "overall_pie":  chart_overall_pie(summary),
@@ -1053,10 +1782,11 @@ def main():
         "release_bar":  chart_release_bar(summary["release_data"]),
         "platform_pie": chart_platform_pie(summary["platform_data"]),
         "burndown":     chart_burndown(summary["burndown_rows"], sprint["name"]),
+        "epic_progress": chart_epic_progress(tracker) if tracker else None,
     }
 
     print("🔄  Building HTML email…")
-    html = build_html(sprint, summary, charts)
+    html = build_html(sprint, summary, charts, tracker=tracker)
 
     datestamp = datetime.now().strftime("%Y%m%d")
     html_file = f"report_{datestamp}.html"
@@ -1067,14 +1797,21 @@ def main():
     print(f"💾  HTML preview saved: {html_file}")
 
     print("🔄  Generating PDF…")
-    generate_pdf(sprint, summary, charts, pdf_file)
+    generate_pdf(sprint, summary, charts, pdf_file, tracker=tracker)
+
+    if local_only:
+        print("\n✅  LOCAL MODE — report files generated, email skipped.")
+        print(f"    Open: {os.path.abspath(html_file)}")
+        print(f"    PDF:  {os.path.abspath(pdf_file)}")
+        return
 
     today_str = datetime.now().strftime("%d %b %Y")
     subject   = (f"Daily Sprint Report — {config.JIRA_PROJECT} | "
                  f"{sprint['name']} | {today_str}")
     print("📧  Sending email with PDF attachment…")
-    send_email(subject, html, pdf_file)
+    send_email(subject, html, pdf_file, html_path=html_file)
 
 
 if __name__ == "__main__":
     main()
+
