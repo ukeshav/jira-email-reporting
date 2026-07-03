@@ -194,10 +194,15 @@ class JiraClient:
 #  STATUS / TYPE HELPERS
 # ══════════════════════════════════════════════════════════════
 
-DONE_SET   = {"Done","Closed","Resolved","Dev Done","QA Approved","Ready For Release"}
-PROG_SET   = {"In Progress","In Development"}
-QA_SET     = {"Ready For QA","In QA","QA In Progress"}
-OPEN_SET   = {"Open","To Do","Reopened","Backlog","New"}
+DONE_SET   = {"Done","Closed","Resolved","Dev Done","QA Approved","Ready For Release",
+              "Released","Deployed","Completed","Fixed","Verified","Accepted","Won't Fix"}
+PROG_SET   = {"In Progress","In Development","Development","Under Review",
+              "Code Review","In Review","In Dev"}
+QA_SET     = {"Ready For QA","In QA","QA In Progress","Testing","UAT",
+              "QA Testing","Ready for Testing","QA Done"}
+OPEN_SET   = {"Open","To Do","Reopened","Backlog","New","Selected for Development"}
+
+_unknown_statuses = set()
 
 def bucket(status):
     s = status.strip()
@@ -205,6 +210,7 @@ def bucket(status):
     if s in PROG_SET:  return "In Progress"
     if s in QA_SET:    return "QA"
     if s in OPEN_SET:  return "Open"
+    _unknown_statuses.add(s)
     return "Other"
 
 def type_key(issue_type):
@@ -1738,6 +1744,8 @@ def main():
     summary = process(issues, sprint)
     print(f"    {summary['total']} issues | {summary['bugs_total']} bugs | "
           f"{summary['completion']}% done")
+    if _unknown_statuses:
+        print(f"    ⚠️  Unrecognised statuses (counted as 'Other'): {sorted(_unknown_statuses)}")
 
     # ── Epic Tracker ─────────────────────────────────────────
     # NOTE: Jira board endpoint NEVER returns Epics — they must be
