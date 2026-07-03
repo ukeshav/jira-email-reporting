@@ -1806,8 +1806,7 @@ def main():
         return
 
     today_str = datetime.now().strftime("%d %b %Y")
-    subject   = (f"Daily Sprint Report — {config.JIRA_PROJECT} | "
-                 f"{sprint['name']} | {today_str}")
+    subject   = f"Cinema - Daily Sprint Report ({sprint['name']}) | {today_str}"
     print("📧  Sending email with PDF attachment…")
     send_email(subject, html, pdf_file, html_path=html_file)
 
