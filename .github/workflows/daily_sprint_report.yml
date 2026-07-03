@@ -49,19 +49,30 @@ jobs:
       # 5. Write config.py from GitHub Secrets
       #    (keeps all credentials out of your code)
       - name: Write config.py from secrets
+        env:
+          JIRA_BASE_URL:  ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL:     ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT:   ${{ secrets.JIRA_PROJECT }}
+          SMTP_HOST:      ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
+          SMTP_USER:      ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:  ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
         run: |
-          cat > config.py << 'CONFIGEOF'
-JIRA_BASE_URL  = "${{ secrets.JIRA_BASE_URL }}"
-JIRA_EMAIL     = "${{ secrets.JIRA_EMAIL }}"
-JIRA_API_TOKEN = "${{ secrets.JIRA_API_TOKEN }}"
-JIRA_PROJECT   = "${{ secrets.JIRA_PROJECT }}"
-SMTP_HOST     = "${{ secrets.SMTP_HOST }}"
-SMTP_PORT     = ${{ secrets.SMTP_PORT }}
-SMTP_USER     = "${{ secrets.SMTP_USER }}"
-SMTP_PASSWORD = "${{ secrets.SMTP_PASSWORD }}"
-EMAIL_FROM    = "${{ secrets.EMAIL_FROM }}"
-EMAIL_TO      = ["${{ secrets.EMAIL_TO }}"]
-CONFIGEOF
+          cat > config.py <<EOF
+          JIRA_BASE_URL  = "$JIRA_BASE_URL"
+          JIRA_EMAIL     = "$JIRA_EMAIL"
+          JIRA_API_TOKEN = "$JIRA_API_TOKEN"
+          JIRA_PROJECT   = "$JIRA_PROJECT"
+          SMTP_HOST      = "$SMTP_HOST"
+          SMTP_PORT      = $SMTP_PORT
+          SMTP_USER      = "$SMTP_USER"
+          SMTP_PASSWORD  = "$SMTP_PASSWORD"
+          EMAIL_FROM     = "$EMAIL_FROM"
+          EMAIL_TO       = ["$EMAIL_TO"]
+          EOF
 
       # 6. Run the report script
       - name: Run Jira Sprint Report
