@@ -101,6 +101,10 @@ class JiraClient:
         """Return (board_id, sprint_dict) for the first active sprint."""
         boards = self._get("board", {"projectKeyOrId": config.JIRA_PROJECT}, agile=True)
         for board in boards.get("values", []):
+            # Skip boards not owned by this project
+            location = board.get("location", {})
+            if location.get("projectKey", "").upper() != config.JIRA_PROJECT.upper():
+                continue
             sprints = self._get(f"board/{board['id']}/sprint",
                                 {"state": "active"}, agile=True)
             active = sprints.get("values", [])
