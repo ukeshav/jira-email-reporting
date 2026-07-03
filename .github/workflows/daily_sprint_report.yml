@@ -60,19 +60,7 @@ jobs:
           SMTP_PASSWORD:  ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
-        run: |
-          {
-            echo "JIRA_BASE_URL  = \"$JIRA_BASE_URL\""
-            echo "JIRA_EMAIL     = \"$JIRA_EMAIL\""
-            echo "JIRA_API_TOKEN = \"$JIRA_API_TOKEN\""
-            echo "JIRA_PROJECT   = \"$JIRA_PROJECT\""
-            echo "SMTP_HOST      = \"$SMTP_HOST\""
-            echo "SMTP_PORT      = $SMTP_PORT"
-            echo "SMTP_USER      = \"$SMTP_USER\""
-            echo "SMTP_PASSWORD  = \"$SMTP_PASSWORD\""
-            echo "EMAIL_FROM     = \"$EMAIL_FROM\""
-            echo "EMAIL_TO       = [\"$EMAIL_TO\"]"
-          } > config.py
+        run: python3 write_config.py
 
       # 6. Run the report script
       - name: Run Jira Sprint Report
