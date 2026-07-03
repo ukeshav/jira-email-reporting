@@ -1095,8 +1095,9 @@ def build_html(sprint, summary, charts, tracker=None):
         '<p>Sprint: <strong>' + sprint.get("name","") + '</strong>',
         ' &nbsp;|&nbsp; Report Date: ' + report_date + '</p></div>',
         sec_meta, sec_overall,
-        sec_epic,          # ← Epic Tracker right after Overall Status
-        sec_release, sec_bugs,
+        sec_release,       # ← Release-wise Bifurcation before Epic Tracker
+        sec_epic,          # ← Epic Tracker — CTO View
+        sec_bugs,
         sec_platform, sec_assign, sec_burndown, sec_bugsheet,
         '<div class="ftr">Automated Daily Progress Report &#8212; ',
         config.JIRA_PROJECT + ' &#8212; ' + report_date,
