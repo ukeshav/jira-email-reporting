@@ -1737,6 +1737,7 @@ def main():
     # ── Argument parsing ──────────────────────────────────────
     local_only = "--local" in sys.argv   # run locally: generate HTML/PDF, skip email
 
+    print(f"    Project: {config.JIRA_PROJECT}")
     print("🔄  Connecting to Jira…")
     client = JiraClient()
 
