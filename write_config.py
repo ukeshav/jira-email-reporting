@@ -1,8 +1,12 @@
 """Reads secrets from environment variables and writes config.py."""
 import os
 
-# EMAIL_TO secret should be comma-separated: email1@domain.com,email2@domain.com
-email_to = [e.strip() for e in os.environ['EMAIL_TO'].split(',')]
+# Parse EMAIL_TO — handles any format:
+#   keshav@hikeapp.com
+#   ["keshav@hikeapp.com"]
+#   keshav@a.com,other@b.com
+raw = os.environ['EMAIL_TO'].strip().strip('[]')
+email_to = [e.strip().strip('"\'') for e in raw.split(',') if e.strip().strip('"\'')]
 
 with open("config.py", "w") as f:
     f.write(f"""JIRA_BASE_URL  = {os.environ['JIRA_BASE_URL']!r}
@@ -17,4 +21,4 @@ EMAIL_FROM     = {os.environ['EMAIL_FROM']!r}
 EMAIL_TO       = {email_to!r}
 """)
 
-print("config.py written successfully.")
+print(f"config.py written successfully. EMAIL_TO={email_to}")
