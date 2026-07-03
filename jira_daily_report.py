@@ -194,23 +194,24 @@ class JiraClient:
 #  STATUS / TYPE HELPERS
 # ══════════════════════════════════════════════════════════════
 
-DONE_SET   = {"Done","Closed","Resolved","Dev Done","QA Approved","Ready For Release",
-              "Released","Deployed","Completed","Fixed","Verified","Accepted","Won't Fix"}
-PROG_SET   = {"In Progress","In Development","Development","Under Review",
-              "Code Review","In Review","In Dev"}
-QA_SET     = {"Ready For QA","In QA","QA In Progress","Testing","UAT",
-              "QA Testing","Ready for Testing","QA Done"}
-OPEN_SET   = {"Open","To Do","Reopened","Backlog","New","Selected for Development"}
+DONE_SET   = {"done","closed","resolved","dev done","qa approved","ready for release",
+              "released","deployed","completed","fixed","verified","accepted","won't fix",
+              "duplicate","invalid","cancelled","in prd"}
+PROG_SET   = {"in progress","in development","development","under review",
+              "code review","in review","in dev","dev in progress"}
+QA_SET     = {"ready for qa","in qa","qa in progress","testing","uat",
+              "qa testing","ready for testing","qa done"}
+OPEN_SET   = {"open","to do","reopened","backlog","new","selected for development"}
 
 _unknown_statuses = set()
 
 def bucket(status):
-    s = status.strip()
+    s = status.strip().lower()
     if s in DONE_SET:  return "Done"
     if s in PROG_SET:  return "In Progress"
     if s in QA_SET:    return "QA"
     if s in OPEN_SET:  return "Open"
-    _unknown_statuses.add(s)
+    _unknown_statuses.add(status.strip())
     return "Other"
 
 def type_key(issue_type):
