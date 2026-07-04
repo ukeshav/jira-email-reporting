@@ -8,7 +8,7 @@ on:
   #   GMT (London)   →  8:00 UTC   → cron: "0 8 * * 1-5"
   #   EST (New York) → 13:00 UTC   → cron: "0 13 * * 1-5"
   schedule:
-    - cron: "30 15 * * *"
+    - cron: "30 15 * * 1-5"
 
   # ── Also allows manual trigger from GitHub Actions UI ────────
   workflow_dispatch:
