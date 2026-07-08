@@ -758,7 +758,7 @@ def build_sec_epic_tracker(tracker, epic_chart_b64):
     # Per-epic cards
     cards = []
     for e in tracker:
-        base_url = e["url"].split("/browse/")[0]   # e.g. https://hike-platform.atlassian.net
+        base_url = e["url"].split("/browse/")[0]   # e.g. https://your-org.atlassian.net
         hcls_map = {"complete":"health-complete","on-track":"health-on-track",
                     "in-prog":"health-in-prog","at-risk":"health-at-risk"}
         hcls = hcls_map.get(e["health_cls"],"")

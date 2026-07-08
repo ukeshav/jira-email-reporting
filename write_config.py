@@ -2,9 +2,9 @@
 import os
 
 # Parse EMAIL_TO — handles any format:
-#   keshav@hikeapp.com
-#   ["keshav@hikeapp.com"]
-#   keshav@a.com,other@b.com
+#   user@example.com
+#   ["user@example.com"]
+#   user@a.com,other@b.com
 raw = os.environ['EMAIL_TO'].strip().strip('[]')
 email_to = [e.strip().strip('"\'') for e in raw.split(',') if e.strip().strip('"\'')]
 
